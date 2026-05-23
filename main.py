@@ -6,10 +6,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 import onnxruntime as ort
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 import io
 import cv2
 from rembg import remove as rembg_remove, new_session as rembg_new_session
+import informative_drawings as inf_draw
 
 app = FastAPI()
 
@@ -21,13 +22,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-session = ort.InferenceSession("artline_fp16_dynamic.onnx")
+session = ort.InferenceSession("checkpoints/artline.onnx")
 rembg_session = rembg_new_session("isnet-general-use")
+anime_model   = inf_draw.load_model("checkpoints/anime_style.onnx")
+contour_model = inf_draw.load_model("checkpoints/contour_style.onnx")
 REMBG_MAX_SIZE = 1024  # cap rembg input to keep CPU inference fast
 
 
 ALPHA_GAMMA = 0.35        # aggressive boost for semi-transparent hair
 ALPHA_BG_CUTOFF = 20 / 255  # alpha values below this are treated as background
+
+
+def open_image(data: bytes, white_bg: bool = True) -> Image.Image:
+    """Open image bytes, correct EXIF rotation, and optionally composite
+    transparent areas on white (prevents .convert(RGB) turning alpha→black)."""
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+    if white_bg and img.mode in ("RGBA", "LA", "PA"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img.convert("RGB"), mask=img.convert("RGBA").split()[3])
+        return bg
+    return img.convert("RGB") if white_bg else img
 
 
 def remove_bg_scaled(img: Image.Image, alpha_gamma: float = ALPHA_GAMMA, **kwargs) -> Image.Image:
@@ -75,14 +89,15 @@ def preprocess(img: Image.Image, size: int = 512):
     return arr.transpose(2, 0, 1)[None, ...], (x_off, y_off, new_w, new_h)
 
 
-def build_svg(binary: np.ndarray, width: int, height: int, min_area: int = 15, smoothing: float = 1.5) -> str:
+def build_svg(binary: np.ndarray, width: int, height: int, min_area: int = 0, smoothing: float = 0) -> str:
     """Trace a binary mask into SVG <path> elements via contour detection."""
     contours, _ = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
     path_parts = []
     for cnt in contours:
         if cv2.contourArea(cnt) < min_area:
             continue
-        cnt = cv2.approxPolyDP(cnt, smoothing, True)
+        if smoothing > 0:
+            cnt = cv2.approxPolyDP(cnt, smoothing, True)
         if len(cnt) < 2:
             continue
         pts = cnt.reshape(-1, 2)
@@ -104,70 +119,128 @@ def build_svg(binary: np.ndarray, width: int, height: int, min_area: int = 15, s
     )
 
 
-@app.post("/predict")
-async def predict(
+@app.post("/predict/artline")
+async def predict_artline(
     file: UploadFile = File(...),
     sensitivity: float = Query(default=1.0, ge=0.1, le=2.0,
                                description="Threshold multiplier: >1 catches more lines, <1 fewer"),
     vectorize: bool = Query(default=True,
-                            description="Return SVG paths (true) or RGBA PNG (false)"),
+                            description="Return SVG (true) or RGBA PNG (false)"),
     remove_background: bool = Query(default=False,
                                     description="Remove background before sketching"),
-    min_area: int = Query(default=15,
+    min_area: int = Query(default=0,
                           description="Minimum contour area in pixels to include in SVG"),
-    smoothing: float = Query(default=1.5,
+    smoothing: float = Query(default=0,
                              description="approxPolyDP epsilon for contour smoothing"),
 ):
     contents = await file.read()
-    img = Image.open(io.BytesIO(contents)).convert("RGB")
+    img = open_image(contents)
+    orig_w, orig_h = img.width, img.height
 
+    alpha_mask = None
     if remove_background:
         img_rgba = remove_bg_scaled(img)
-        # composite subject onto white canvas
-        white = Image.new("RGB", img_rgba.size, (255, 255, 255))
-        white.paste(img_rgba, mask=img_rgba.split()[3])
-        img = white
-
-    orig_w, orig_h = img.width, img.height
+        alpha_mask = np.array(img_rgba.split()[3])  # H×W uint8
 
     tensor, (x_off, y_off, new_w, new_h) = preprocess(img)
 
-    input_name = session.get_inputs()[0].name
-    output = session.run(None, {input_name: tensor})[0]
-    # output shape: [1, 3, H, W]
-
-    # de-normalize
+    output = session.run(None, {session.get_inputs()[0].name: tensor})[0]
     rgb = output[0] * IMAGENET_STD[:, None, None] + IMAGENET_MEAN[:, None, None]
     rgb = np.clip(rgb, 0.0, 1.0) * 255.0
-    rgb = rgb.astype(np.uint8)  # [3, H, W]
+    rgb = rgb.astype(np.uint8)[:, y_off:y_off + new_h, x_off:x_off + new_w]
 
-    # crop padding back to content region
-    rgb = rgb[:, y_off:y_off + new_h, x_off:x_off + new_w]  # [3, new_h, new_w]
-
-    # luma
     r, g, b = rgb
     luma = (0.299 * r + 0.587 * g + 0.114 * b).astype(np.uint8)
-
-    # Otsu threshold shifted by sensitivity (no pre-blur — preserves thin lines)
     thr_raw, _ = cv2.threshold(luma, 0, 255, cv2.THRESH_OTSU)
     thr = int(np.clip(thr_raw * sensitivity, 0, 255))
-
     binary = np.where(luma < thr, 255, 0).astype(np.uint8)
 
-    # scale back to original image dimensions
     if (new_w, new_h) != (orig_w, orig_h):
         binary = cv2.resize(binary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
 
-    if vectorize:
-        svg = build_svg(binary, orig_w, orig_h, min_area=min_area, smoothing=smoothing)
-        return Response(svg.encode(), media_type="image/svg+xml")
+    if alpha_mask is not None:
+        binary[alpha_mask < 128] = 0
 
-    # fallback: RGBA PNG
-    mask = np.zeros((orig_h, orig_w, 4), dtype=np.uint8)
+    return _sketch_response(binary, orig_w, orig_h, vectorize, min_area, smoothing)
+
+
+@app.post("/predict/anime")
+async def predict_anime(
+    file: UploadFile = File(...),
+    vectorize: bool = Query(default=True,
+                            description="Return SVG (true) or RGBA PNG (false)"),
+    remove_background: bool = Query(default=False,
+                                    description="Remove background before sketching"),
+    min_area: int = Query(default=0,
+                          description="Minimum contour area in pixels to include in SVG"),
+    smoothing: float = Query(default=0,
+                             description="approxPolyDP epsilon for contour smoothing"),
+    dilation_px: int = Query(default=1, ge=0, le=5,
+                             description="Line thickening radius in pixels"),
+    close_px: int = Query(default=1, ge=0, le=5,
+                          description="Morphological closing radius to connect line gaps"),
+):
+    contents = await file.read()
+    img = open_image(contents)
+    orig_w, orig_h = img.width, img.height
+
+    alpha_mask = None
+    if remove_background:
+        img_rgba = remove_bg_scaled(img)
+        alpha_mask = np.array(img_rgba.split()[3])  # H×W uint8
+
+    sketch = inf_draw.run_inference(img, anime_model)
+    binary = inf_draw.to_binary(sketch, dilation_px=dilation_px, close_px=close_px)
+
+    if alpha_mask is not None:
+        binary[alpha_mask < 128] = 0
+
+    return _sketch_response(binary, orig_w, orig_h, vectorize, min_area, smoothing)
+
+
+@app.post("/predict/contour")
+async def predict_contour(
+    file: UploadFile = File(...),
+    vectorize: bool = Query(default=True,
+                            description="Return SVG (true) or RGBA PNG (false)"),
+    remove_background: bool = Query(default=False,
+                                    description="Remove background before sketching"),
+    min_area: int = Query(default=0,
+                          description="Minimum contour area in pixels to include in SVG"),
+    smoothing: float = Query(default=0,
+                             description="approxPolyDP epsilon for contour smoothing"),
+    dilation_px: int = Query(default=0, ge=0, le=5,
+                             description="Line thickening radius in pixels"),
+    close_px: int = Query(default=0, ge=0, le=5,
+                          description="Morphological closing radius to connect line gaps"),
+):
+    contents = await file.read()
+    img = open_image(contents)
+    orig_w, orig_h = img.width, img.height
+
+    alpha_mask = None
+    if remove_background:
+        img_rgba = remove_bg_scaled(img)
+        alpha_mask = np.array(img_rgba.split()[3])  # H×W uint8
+
+    sketch = inf_draw.run_inference(img, contour_model)
+    binary = inf_draw.to_binary(sketch, dilation_px=dilation_px, close_px=close_px)
+
+    if alpha_mask is not None:
+        binary[alpha_mask < 128] = 0
+
+    return _sketch_response(binary, orig_w, orig_h, vectorize, min_area, smoothing)
+
+
+def _sketch_response(binary: np.ndarray, width: int, height: int,
+                     vectorize: bool, min_area: int, smoothing: float) -> Response:
+    if vectorize:
+        svg = build_svg(binary, width, height, min_area=min_area, smoothing=smoothing)
+        return Response(svg.encode(), media_type="image/svg+xml")
+    mask = np.zeros((height, width, 4), dtype=np.uint8)
     mask[binary == 255, 3] = 255
-    pil_mask = Image.fromarray(mask, mode="RGBA")
     buf = io.BytesIO()
-    pil_mask.save(buf, format="PNG")
+    Image.fromarray(mask, mode="RGBA").save(buf, format="PNG")
     buf.seek(0)
     return Response(buf.read(), media_type="image/png")
 
@@ -179,7 +252,7 @@ async def remove_bg(
                                 description="Refine edges with alpha matting (slower, better for hair/fur)"),
 ):
     contents = await file.read()
-    img = Image.open(io.BytesIO(contents))
+    img = open_image(contents, white_bg=False)
     result = remove_bg_scaled(
         img,
         alpha_matting=alpha_matting,

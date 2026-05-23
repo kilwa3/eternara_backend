@@ -1,5 +1,9 @@
 test/
 venv/
-*.pkl
-*.onnx
 __pycache__/
+checkpoints/*.onnx
+checkpoints/*.pth
+*.onnx
+*.pkl
+*.pth
+*.data

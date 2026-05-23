@@ -1,0 +1,25 @@
+Model:   ISNet (isnet-general-use)
+Used by: /remove-bg endpoint via rembg library
+Source:  https://github.com/xuebinqin/DIS
+Paper:   "Highly Accurate Dichotomous Image Segmentation"
+         Xuebin Qin, Hang Dai, Xiaobin Hu, Deng-Ping Fan, Ling Shao, Luc Van Gool — ECCV 2022
+         https://arxiv.org/pdf/2203.03041.pdf
+
+License: Apache License 2.0
+         https://github.com/xuebinqin/DIS/blob/main/LICENSE.md
+
+Note: This model is NOT stored in this folder. It is downloaded automatically
+by rembg on first use and cached at ~/.u2net/isnet-general-use.onnx.
+The model weights are subject to the DIS5K Dataset Terms of Use in addition
+to the Apache 2.0 code license:
+https://github.com/xuebinqin/DIS/blob/main/DIS5K-Dataset-Terms-of-Use.pdf
+
+---
+
+Apache License 2.0 Summary:
+You may use, reproduce, and distribute the work and derivative works thereof
+in source and object form, subject to the conditions of the Apache License 2.0.
+You must give appropriate credit, provide a link to the license, and indicate
+if changes were made.
+
+Full license text: https://www.apache.org/licenses/LICENSE-2.0
