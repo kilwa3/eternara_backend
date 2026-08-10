@@ -89,7 +89,7 @@ def preprocess(img: Image.Image, size: int = 512):
     return arr.transpose(2, 0, 1)[None, ...], (x_off, y_off, new_w, new_h)
 
 
-def build_svg(binary: np.ndarray, width: int, height: int, min_area: int = 0, smoothing: float = 0) -> str:
+def build_svg(binary: np.ndarray, width: int, height: int, min_area: int = 0, smoothing: float = 0, fill: str = "#000000") -> str:
     """Trace a binary mask into SVG <path> elements via contour detection."""
     contours, _ = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
     path_parts = []
@@ -107,14 +107,14 @@ def build_svg(binary: np.ndarray, width: int, height: int, min_area: int = 0, sm
         d += " Z"
         path_parts.append(d)
 
-    path_d = " ".join(path_parts)
+    full_d = " ".join(path_parts)
     return (
         f'<?xml version="1.0" encoding="UTF-8"?>'
         f'<svg xmlns="http://www.w3.org/2000/svg" '
         f'width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}">'
-        + (f'<path d="{path_d}" fill="#000000" fill-rule="evenodd" stroke="none"/>'
-           if path_d else "")
+        + (f'<path d="{full_d}" fill="{fill}" fill-rule="evenodd" stroke="none"/>'
+           if full_d else "")
         + "</svg>"
     )
 
@@ -126,8 +126,8 @@ async def predict_artline(
                                description="Threshold multiplier: >1 catches more lines, <1 fewer"),
     vectorize: bool = Query(default=True,
                             description="Return SVG (true) or RGBA PNG (false)"),
-    remove_background: bool = Query(default=False,
-                                    description="Remove background before sketching"),
+    dark_material: bool = Query(default=False,
+                                description="Scratchboard mode: engrave filled silhouette with line grooves (for dark/black material)"),
     min_area: int = Query(default=0,
                           description="Minimum contour area in pixels to include in SVG"),
     smoothing: float = Query(default=0,
@@ -138,9 +138,8 @@ async def predict_artline(
     orig_w, orig_h = img.width, img.height
 
     alpha_mask = None
-    if remove_background:
-        img_rgba = remove_bg_scaled(img)
-        alpha_mask = np.array(img_rgba.split()[3])  # H×W uint8
+    if dark_material:
+        alpha_mask = np.array(remove_bg_scaled(img).split()[3])
 
     tensor, (x_off, y_off, new_w, new_h) = preprocess(img)
 
@@ -158,10 +157,12 @@ async def predict_artline(
     if (new_w, new_h) != (orig_w, orig_h):
         binary = cv2.resize(binary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
 
-    if alpha_mask is not None:
-        binary[alpha_mask < 128] = 0
+    if dark_material:
+        out = np.where((alpha_mask >= 128) & (binary == 0), 255, 0).astype(np.uint8)
+    else:
+        out = binary
 
-    return _sketch_response(binary, orig_w, orig_h, vectorize, min_area, smoothing)
+    return _sketch_response(out, orig_w, orig_h, vectorize, min_area, smoothing, dark_material=dark_material)
 
 
 @app.post("/predict/anime")
@@ -169,8 +170,8 @@ async def predict_anime(
     file: UploadFile = File(...),
     vectorize: bool = Query(default=True,
                             description="Return SVG (true) or RGBA PNG (false)"),
-    remove_background: bool = Query(default=False,
-                                    description="Remove background before sketching"),
+    dark_material: bool = Query(default=False,
+                                description="Scratchboard mode: engrave filled silhouette with line grooves (for dark/black material)"),
     min_area: int = Query(default=0,
                           description="Minimum contour area in pixels to include in SVG"),
     smoothing: float = Query(default=0,
@@ -185,17 +186,18 @@ async def predict_anime(
     orig_w, orig_h = img.width, img.height
 
     alpha_mask = None
-    if remove_background:
-        img_rgba = remove_bg_scaled(img)
-        alpha_mask = np.array(img_rgba.split()[3])  # H×W uint8
+    if dark_material:
+        alpha_mask = np.array(remove_bg_scaled(img).split()[3])
 
     sketch = inf_draw.run_inference(img, anime_model)
     binary = inf_draw.to_binary(sketch, dilation_px=dilation_px, close_px=close_px)
 
-    if alpha_mask is not None:
-        binary[alpha_mask < 128] = 0
+    if dark_material:
+        out = np.where((alpha_mask >= 128) & (binary == 0), 255, 0).astype(np.uint8)
+    else:
+        out = binary
 
-    return _sketch_response(binary, orig_w, orig_h, vectorize, min_area, smoothing)
+    return _sketch_response(out, orig_w, orig_h, vectorize, min_area, smoothing, dark_material=dark_material)
 
 
 @app.post("/predict/contour")
@@ -203,8 +205,8 @@ async def predict_contour(
     file: UploadFile = File(...),
     vectorize: bool = Query(default=True,
                             description="Return SVG (true) or RGBA PNG (false)"),
-    remove_background: bool = Query(default=False,
-                                    description="Remove background before sketching"),
+    dark_material: bool = Query(default=False,
+                                description="Scratchboard mode: engrave filled silhouette with line grooves (for dark/black material)"),
     min_area: int = Query(default=0,
                           description="Minimum contour area in pixels to include in SVG"),
     smoothing: float = Query(default=0,
@@ -219,26 +221,35 @@ async def predict_contour(
     orig_w, orig_h = img.width, img.height
 
     alpha_mask = None
-    if remove_background:
-        img_rgba = remove_bg_scaled(img)
-        alpha_mask = np.array(img_rgba.split()[3])  # H×W uint8
+    if dark_material:
+        alpha_mask = np.array(remove_bg_scaled(img).split()[3])
 
     sketch = inf_draw.run_inference(img, contour_model)
     binary = inf_draw.to_binary(sketch, dilation_px=dilation_px, close_px=close_px)
 
-    if alpha_mask is not None:
-        binary[alpha_mask < 128] = 0
+    if dark_material:
+        out = np.where((alpha_mask >= 128) & (binary == 0), 255, 0).astype(np.uint8)
+    else:
+        out = binary
 
-    return _sketch_response(binary, orig_w, orig_h, vectorize, min_area, smoothing)
+    return _sketch_response(out, orig_w, orig_h, vectorize, min_area, smoothing, dark_material=dark_material)
 
 
 def _sketch_response(binary: np.ndarray, width: int, height: int,
-                     vectorize: bool, min_area: int, smoothing: float) -> Response:
+                     vectorize: bool, min_area: int, smoothing: float,
+                     dark_material: bool = False) -> Response:
     if vectorize:
-        svg = build_svg(binary, width, height, min_area=min_area, smoothing=smoothing)
+        fill = "#ffffff" if dark_material else "#000000"
+        svg = build_svg(binary, width, height, min_area=min_area, smoothing=smoothing, fill=fill)
         return Response(svg.encode(), media_type="image/svg+xml")
     mask = np.zeros((height, width, 4), dtype=np.uint8)
-    mask[binary == 255, 3] = 255
+    if dark_material:
+        # White opaque where engraved, transparent elsewhere (background + line grooves)
+        mask[:, :, :3] = 255
+        mask[:, :, 3] = binary
+    else:
+        # Black opaque lines, transparent background
+        mask[binary == 255, 3] = 255
     buf = io.BytesIO()
     Image.fromarray(mask, mode="RGBA").save(buf, format="PNG")
     buf.seek(0)
